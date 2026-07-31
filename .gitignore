@@ -1,0 +1,36 @@
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.backup
+tfplan
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+dist/
+*.egg-info/
+venv/
+.venv/
+
+# Secrets / env
+.env
+.env.*
+*.pem
+*.key
+credentials
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo

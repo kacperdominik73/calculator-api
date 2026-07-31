@@ -1,0 +1,99 @@
+name: Build & Deploy
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+
+  build-push:
+    name: Build & Push to ECR
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      registry: ${{ steps.login-ecr.outputs.registry }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: eu-central-1
+          mask-aws-account-id: true
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push to ECR
+        run: |
+          REGISTRY=${{ steps.login-ecr.outputs.registry }}
+          SHA_TAG=$REGISTRY/calculator-api:${{ github.sha }}
+          VERSION_TAG=$REGISTRY/calculator-api:v$(cat VERSION)
+          docker build -t $SHA_TAG -t $VERSION_TAG .
+          docker push $SHA_TAG
+          docker push $VERSION_TAG
+
+  deploy:
+    name: Deploy to ECS
+    needs: build-push
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: eu-central-1
+          mask-aws-account-id: true
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Inject account ID into task definition
+        run: |
+          ACCOUNT_ID=$(echo "${{ steps.login-ecr.outputs.registry }}" | cut -d. -f1)
+          sed -i "s/AWS_ACCOUNT_ID/$ACCOUNT_ID/g" infra/task-definition.json
+
+      - name: Render new task definition
+        id: render-task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: infra/task-definition.json
+          container-name: calculator-api
+          image: ${{ steps.login-ecr.outputs.registry }}/calculator-api:${{ github.sha }}
+
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render-task-def.outputs.task-definition }}
+          service: calculator-api-service
+          cluster: calculator-api-cluster
+          wait-for-service-stability: true
+
+  release:
+    name: GitHub Release
+    needs: deploy
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Extract version
+        id: version
+        run: echo "version=$(cat VERSION)" >> $GITHUB_OUTPUT
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: Release v${{ steps.version.outputs.version }}
+          generate_release_notes: true

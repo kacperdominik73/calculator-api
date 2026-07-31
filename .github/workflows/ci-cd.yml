@@ -1,0 +1,191 @@
+name: CI/CD
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Run tests
+        run: pytest tests/ -v --cov=app --cov-report=xml --cov-report=term-missing
+      - name: Post coverage comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const fs = require('fs');
+            const xml = fs.readFileSync('coverage.xml', 'utf8');
+            const match = xml.match(/line-rate="([^"]+)"/);
+            const pct = match ? (parseFloat(match[1]) * 100).toFixed(1) : '?';
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `### Coverage: ${pct}%`
+            });
+
+  build:
+    name: Build Image
+    needs: [test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build Docker image
+        run: docker build -t calculator-api:${{ github.sha }} .
+      - name: Save image to tar
+        run: docker save calculator-api:${{ github.sha }} -o image.tar
+      - uses: actions/upload-artifact@v7
+        with:
+          name: docker-image
+          path: image.tar
+          retention-days: 30
+
+  trivy-scan:
+    name: Trivy CVE Scan
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: docker-image
+      - name: Load image
+        run: docker load -i image.tar
+      - name: Scan for vulnerabilities
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: calculator-api:${{ github.sha }}
+          format: table
+          exit-code: "1"
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+      - name: Generate vulnerability report
+        if: always()
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: calculator-api:${{ github.sha }}
+          format: json
+          output: trivy-report.json
+          severity: CRITICAL,HIGH,MEDIUM
+          ignore-unfixed: false
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: trivy-report
+          path: trivy-report.json
+          retention-days: 30
+
+  push:
+    name: Push to ECR
+    needs: [trivy-scan]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: docker-image
+      - name: Load image
+        run: docker load -i image.tar
+
+      - name: Configure AWS credentials (OIDC)
+        uses: ./.github/actions/aws-auth
+        with:
+          role-arn: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: eu-central-1
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Tag and push to ECR
+        run: |
+          docker tag calculator-api:${{ github.sha }} ${{ steps.login-ecr.outputs.registry }}/calculator-api:${{ github.sha }}
+          docker push ${{ steps.login-ecr.outputs.registry }}/calculator-api:${{ github.sha }}
+
+  deploy:
+    name: Deploy to ECS
+    needs: push
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Configure AWS credentials (OIDC)
+        uses: ./.github/actions/aws-auth
+        with:
+          role-arn: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: eu-central-1
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Fill account ID in task definition
+        run: |
+          ACCOUNT_ID=$(echo "${{ steps.login-ecr.outputs.registry }}" | cut -d. -f1)
+          sed -i "s/AWS_ACCOUNT_ID/$ACCOUNT_ID/g" infra/task-definition.json
+
+      - name: Render new task definition
+        id: render-task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: infra/task-definition.json
+          container-name: calculator-api
+          image: ${{ steps.login-ecr.outputs.registry }}/calculator-api:${{ github.sha }}
+
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render-task-def.outputs.task-definition }}
+          service: calculator-api-service
+          cluster: calculator-api-cluster
+          wait-for-service-stability: true
+
+  release:
+    name: GitHub Release
+    needs: [deploy]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Extract version
+        id: version
+        run: echo "version=$(cat VERSION)" >> $GITHUB_OUTPUT
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: Release v${{ steps.version.outputs.version }}
+          generate_release_notes: true
