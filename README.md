@@ -2,6 +2,10 @@
 
 A simple REST API for arithmetic operations, deployed to AWS ECS Fargate via GitHub Actions and Terraform.
 
+# URL
+
+http://calculator-api-alb-1139568096.eu-central-1.elb.amazonaws.com/
+
 ## Architecture
 
 ```
